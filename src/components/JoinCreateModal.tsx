@@ -78,7 +78,7 @@ export const JoinCreateModal: React.FC<JoinCreateModalProps> = ({ onJoinOrCreate
             <Lock className="w-8 h-8" />
           </div>
           <h1 className="text-2xl font-bold text-white tracking-tight">
-            Telegram Secret
+            tg-enc
           </h1>
           <p className="text-xs text-slate-400 mt-1 max-w-xs mx-auto">
             1-on-1 End-to-End Encrypted Cloud Messenger
