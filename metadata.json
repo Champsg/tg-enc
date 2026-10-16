@@ -1,0 +1,5 @@
+{
+  "name": "tg-enc",
+  "description": "A private 1-on-1 end-to-end encrypted Telegram-styled web messenger with real-time Supabase cloud relay, encrypted media and file sharing, and panic wipe.",
+  "requestFramePermissions": ["camera", "microphone"]
+}
