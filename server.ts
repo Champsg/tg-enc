@@ -303,7 +303,9 @@ async function startServer() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`tg-enc server listening on port ${PORT}`);
+    console.log(`\n  ➜  Local:   http://localhost:${PORT}/`);
+    console.log(`  ➜  Network: http://127.0.0.1:${PORT}/\n`);
+    console.log(`tg-enc server running on port ${PORT}`);
   });
 }
 
