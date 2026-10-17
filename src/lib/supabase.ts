@@ -22,69 +22,84 @@ export const supabase: SupabaseClient = createClient(
 // ----------------------------------------------------------------- simple user login
 
 export async function joinAsUser(
-  rawUsername: string,
+  identifier: string,
   rawDisplayName: string
 ): Promise<{ user: LocalIdentity | null; error: string | null }> {
-  const username = rawUsername.trim().toLowerCase().replace(/^@+/, '').replace(/[^a-z0-9_]/g, '');
-  if (!username) {
-    return { user: null, error: 'Please choose a valid username.' };
+  const trimmed = identifier.trim().toLowerCase();
+  if (!trimmed) {
+    return { user: null, error: 'Please enter your username handle or email.' };
   }
 
-  const displayName = rawDisplayName.trim() || username;
+  const isEmail = trimmed.includes('@') && trimmed.includes('.');
+  const username = isEmail
+    ? trimmed.split('@')[0].replace(/[^a-z0-9_]/g, '')
+    : trimmed.replace(/^@+/, '').replace(/[^a-z0-9_]/g, '');
+
+  if (!username) {
+    return { user: null, error: 'Please enter a valid username.' };
+  }
 
   try {
-    // Check if user already exists
-    const existing = await fetchProfileByUsername(username);
-    if (existing) {
-      // User exists - log straight into this profile
-      await touchLastSeen(existing.userId);
-      const user: LocalIdentity = {
-        userId: existing.userId,
-        username: existing.username,
-        displayName: existing.displayName,
-        createdAt: Date.now(),
-      };
-      return { user, error: null };
-    }
-
-    // New user - create profile
-    const userId = `u_${username}`;
-    const { error: insertError } = await supabase.from('profiles').insert([
-      {
-        id: userId,
-        username,
-        display_name: displayName,
-        last_seen: Date.now(),
-      },
-    ]);
-
-    if (insertError) {
-      // If race condition where username was inserted simultaneously, fetch it
-      const fallback = await fetchProfileByUsername(username);
-      if (fallback) {
+    // 1. Try finding by email
+    if (isEmail) {
+      const { data } = await supabase
+        .from('profiles')
+        .select('id, username, display_name, email')
+        .eq('email', trimmed)
+        .limit(1);
+      if (data && data.length > 0) {
+        await touchLastSeen(data[0].id);
         return {
           user: {
-            userId: fallback.userId,
-            username: fallback.username,
-            displayName: fallback.displayName,
+            userId: data[0].id,
+            username: data[0].username,
+            displayName: data[0].display_name,
             createdAt: Date.now(),
           },
           error: null,
         };
       }
-      return { user: null, error: insertError.message };
     }
 
-    const newUser: LocalIdentity = {
-      userId,
-      username,
-      displayName,
-      createdAt: Date.now(),
-    };
+    // 2. Try finding by username
+    const existing = await fetchProfileByUsername(username);
+    if (existing) {
+      await touchLastSeen(existing.userId);
+      return {
+        user: {
+          userId: existing.userId,
+          username: existing.username,
+          displayName: existing.displayName,
+          createdAt: Date.now(),
+        },
+        error: null,
+      };
+    }
 
-    return { user: newUser, error: null };
+    // 3. New user - create profile
+    const displayName = rawDisplayName.trim() || username;
+    const userId = `u_${username}`;
+    await supabase.from('profiles').insert([
+      {
+        id: userId,
+        username,
+        display_name: displayName,
+        email: isEmail ? trimmed : null,
+        last_seen: Date.now(),
+      },
+    ]);
+
+    return {
+      user: {
+        userId,
+        username,
+        displayName,
+        createdAt: Date.now(),
+      },
+      error: null,
+    };
   } catch (err) {
-    return { user: null, error: (err as Error).message || 'Could not connect to database.' };
+    return { user: null, error: (err as Error).message || 'Could not sign in.' };
   }
 }
 
