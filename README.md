@@ -1,34 +1,35 @@
 # tg-enc
 
-A high-performance, private 1-on-1 end-to-end encrypted Telegram-styled web messenger with real-time Supabase cloud relay, WebCrypto AES-256-GCM encryption, encrypted media & voice sharing, safety number verification, and remote panic wipe.
+A private, Telegram-styled, **text-only** messenger with end-to-end encryption.
 
-## 🚀 Features
+No room ids. No passkeys. No invite codes. You pick a username, friends find you
+by your `@handle`, and every conversation stays in your history until someone
+deletes it.
 
-- **End-to-End Encryption**: AES-256-GCM authenticated encryption using keys derived via PBKDF2 directly in the browser. Zero plaintext ever reaches servers.
-- **Supabase Cloud Relay & Storage**: Real-time broadcast channels and persistent encrypted envelopes table with Row Level Security (RLS).
-- **Embedded WebSocket Fallback Server**: Full Node.js / Express WebSocket relay fallback.
-- **Encrypted Media & Voice**: Client-side encrypted image, file, and voice note sharing.
-- **Privacy & Security**: Screen blur privacy shield, safety number fingerprint comparison, self-destructing messages, and panic wipe.
+## Features
 
----
+- **Just a username** — pick a handle once; nothing else to copy or share.
+- **End-to-end encryption** — each device owns an ECDH P-256 keypair that never leaves the browser. A shared chat key is negotiated automatically (ECDH → HKDF-SHA-256) and messages are sealed with AES-256-GCM.
+- **Permanent history** — messages are stored encrypted in Supabase and reloaded whenever you open the chat, with “load older” pagination.
+- **Real-time inbox** — new chats and incoming messages appear live, even when the conversation is not open. Unread badges included.
+- **No strangers in your database** — every row is scoped by Supabase row-level security to the two participants, and a message can only be inserted by its real sender.
+- **Delete on your terms** — “Delete chat” removes the conversation for both people. Nothing expires on its own.
+- **Replies, reactions, read receipts, typing indicator** — all persisted (reactions and read state survive a reload).
+- **Privacy extras** — instant screen blur and an encryption-verification screen.
+- **Account safety** — back up your account to a file and restore it on another device.
 
-## 🛠️ Quick Start
+## Setup
 
-### 1. Prerequisites
-- [Node.js](https://nodejs.org/) (v18 or higher recommended)
-- [npm](https://www.npmjs.com/)
+### 1. Install
 
-### 2. Install Dependencies
 ```bash
 npm install
 ```
 
-### 3. Configure Supabase Environment
-Copy `.env.example` to `.env`:
-```bash
-cp .env.example .env
-```
-Provide your Supabase URL and Publishable / Anon Key in `.env`:
+### 2. Environment
+
+Copy `.env.example` to `.env` and fill in your Supabase URL and publishable (anon) key:
+
 ```env
 SUPABASE_URL="https://your-project.supabase.co"
 SUPABASE_ANON_KEY="your-supabase-publishable-key"
@@ -37,55 +38,53 @@ VITE_SUPABASE_ANON_KEY="your-supabase-publishable-key"
 PORT=3000
 ```
 
-### 4. Database Setup (Supabase)
-Run the migration script in your Supabase Dashboard **SQL Editor**:
-```sql
-create table if not exists public.secret_envelopes (
-  id text primary key,
-  room_id text not null,
-  sender_id text not null,
-  sender_name text not null,
-  type text not null,
-  payload jsonb,
-  metadata jsonb,
-  reply_to_id text,
-  timestamp bigint not null,
-  created_at timestamptz default now()
-);
+No project URL or key is hard-coded in the source.
 
-create index if not exists idx_secret_envelopes_room_id on public.secret_envelopes(room_id, timestamp asc);
-alter table public.secret_envelopes enable row level security;
+### 3. Enable anonymous sign-in
 
-create policy "Allow anon insert" on public.secret_envelopes for insert with check (true);
-create policy "Allow anon select" on public.secret_envelopes for select using (true);
-create policy "Allow anon delete" on public.secret_envelopes for delete using (true);
-```
+Supabase dashboard → **Authentication → Sign In / Providers → Anonymous sign-ins → Enable**.
 
-### 5. Run Locally
+This gives every device a real session (`auth.uid()`), which is what lets the
+database enforce that you can only read your own conversations and only send
+messages as yourself.
+
+### 4. Create the tables
+
+Paste [`supabase-setup.sql`](./supabase-setup.sql) into **SQL Editor** and run it.
+The app shows the same script on its first screen and checks each setup step.
+
+### 5. Run
+
 ```bash
 npm run dev
 ```
-Open `http://localhost:3000` in your browser.
 
----
+Open http://localhost:3000.
 
-## 📦 Production Deployment
+## Production
 
-### Build for Production:
 ```bash
 npm run build
-```
-
-### Start Production Server:
-```bash
 npm start
 ```
-The server serves the compiled Vite frontend from `dist/` along with the WebSocket and REST relay endpoints.
 
----
+The Node process only serves the frontend. All realtime traffic and storage go
+directly to Supabase, so the app also works on static hosting.
 
-## 🔒 Security Architecture
-- Keys are derived locally using PBKDF2 (`SHA-256`, 100,000 iterations).
-- Messages and attachments are encrypted with AES-256-GCM with unique Initialization Vectors (IV).
-- Passkeys never leave client memory or devices.
-- Supabase stores only zero-knowledge ciphertext envelopes.
+## How it works
+
+1. On first run the browser gets an anonymous Supabase session and generates an ECDH keypair. The private key stays in this browser.
+2. Your public key and `@username` are published to `profiles` so people can find you.
+3. Starting a chat writes one `conversations` row containing the two participants and an opaque `chat_id` (SHA-256 of the two user ids).
+4. Both sides derive the same AES-256-GCM key from their own private key and the other person’s public key. No secret is ever transmitted.
+5. Messages are encrypted locally, stored in `direct_messages`, and delivered live over Supabase Realtime.
+6. Row-level security uses `auth.uid()` to make reads, inserts and deletes participant-only.
+7. Opening a chat decrypts history (100 messages at a time) and restores persisted reactions and read state.
+
+## Security notes
+
+- **Content is zero-knowledge.** Supabase stores ciphertext and an opaque chat id; without your device key the messages cannot be read.
+- **The server cannot forge messages.** Inserts must come from the authenticated sender and membership is checked in the database.
+- **A changed contact key triggers a warning.** The app never silently accepts a new public key for an existing chat.
+- **The account backup file is sensitive.** It contains your session tokens and private key — treat it like a password.
+- **This is still a personal project, not an audited messenger.** There is no key rotation / forward secrecy, no multi-device sync beyond restoring a backup, and no report/block tooling.

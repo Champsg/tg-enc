@@ -1,56 +1,42 @@
-export type MessageType = 'text' | 'file' | 'audio' | 'reaction' | 'typing' | 'status' | 'wipe';
-
-export interface EncryptedPayload {
-  ciphertext: string;
-  iv: string;
-}
-
-export interface EncryptedFileMetadata {
-  fileName: string;
-  mimeType: string;
-  fileSize: number;
-  duration?: number; // for audio
-  width?: number; // for images
-  height?: number; // for images
-}
-
-export interface EncryptedEnvelope {
-  id: string;
-  roomId: string;
-  senderId: string;
-  senderName: string;
-  type: MessageType;
-  payload?: EncryptedPayload;
-  metadata?: EncryptedFileMetadata;
-  replyToId?: string;
-  reactionEmoji?: string;
-  targetMessageId?: string;
-  timestamp: number;
-}
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
 export interface DecryptedMessage {
   id: string;
-  roomId: string;
+  chatId: string;
   senderId: string;
-  senderName: string;
-  type: 'text' | 'file' | 'audio';
-  content: string; // text content or base64 file preview data URL
-  fileBlobUrl?: string; // object URL for download / playback
-  fileMetadata?: EncryptedFileMetadata;
+  content: string;
   replyToId?: string;
   replySnippet?: string;
   timestamp: number;
-  status: 'sent' | 'delivered' | 'read';
-  reactions: Record<string, string[]>; // emoji -> array of sender names
+  status: MessageStatus;
+  reactions: Record<string, string[]>; // emoji -> display names
 }
 
-export interface UserSession {
+export type Message = DecryptedMessage;
+
+export interface UserProfile {
   userId: string;
   username: string;
-  roomId: string;
-  roomPasskey: string;
-  safetyNumber: string;
-  isHost: boolean;
+  displayName: string;
+  email?: string;
+}
+
+export interface LocalIdentity {
+  userId: string;
+  username: string;
+  displayName: string;
+  email?: string;
+  createdAt: number;
+}
+
+export interface ChatSummary {
+  chatId: string;
+  peerId: string;
+  peerUsername: string;
+  peerName: string;
+  updatedAt: number;
+  lastMessage?: string;
+  unread?: boolean;
 }
 
 export interface PeerState {

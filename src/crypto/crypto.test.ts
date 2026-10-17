@@ -1,89 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  deriveRoomKey,
-  encryptText,
-  decryptText,
-  encryptBinary,
-  decryptBinary,
-  generateSafetyNumber,
-  generateRoomId,
-  generateRandomPasskey,
   stringToArrayBuffer,
   arrayBufferToString,
+  buildChatId,
+  normalizeUsername,
+  generateUserId,
+  uint8ArrayToBase64,
+  base64ToUint8Array,
 } from './crypto.ts';
 
-test('stringToArrayBuffer and arrayBufferToString roundtrip correctly', () => {
-  const original = 'Hello tg-enc! 🔐';
-  const buffer = stringToArrayBuffer(original);
-  const result = arrayBufferToString(buffer);
-  assert.equal(result, original);
+test('text encoding round-trips', () => {
+  const original = 'Hello tg-enc! Simple messaging app';
+  assert.equal(arrayBufferToString(stringToArrayBuffer(original)), original);
 });
 
-test('deriveRoomKey derives consistent keys for matching passkey and roomId', async () => {
-  const passkey = 'secret-test-passkey-123';
-  const roomId = 'room-abc';
-
-  const key1 = await deriveRoomKey(passkey, roomId);
-  const key2 = await deriveRoomKey(passkey, roomId);
-
-  const num1 = await generateSafetyNumber(key1);
-  const num2 = await generateSafetyNumber(key2);
-
-  assert.equal(num1, num2);
-  assert.equal(num1.split(' ').length, 12);
+test('base64 helpers round-trip binary bytes', () => {
+  const bytes = new Uint8Array([0, 1, 2, 250, 251, 255]);
+  assert.deepEqual(base64ToUint8Array(uint8ArrayToBase64(bytes)), bytes);
 });
 
-test('deriveRoomKey derives different keys for different passkeys or roomIds', async () => {
-  const keyA = await deriveRoomKey('passkey-one', 'room-abc');
-  const keyB = await deriveRoomKey('passkey-two', 'room-abc');
+test('chat ids are stable and independent of participant order', () => {
+  const ab = buildChatId('u_alice', 'u_bob');
+  const ba = buildChatId('u_bob', 'u_alice');
 
-  const numA = await generateSafetyNumber(keyA);
-  const numB = await generateSafetyNumber(keyB);
-
-  assert.notEqual(numA, numB);
+  assert.equal(ab, ba);
+  assert.equal(ab, 'chat_u_alice_u_bob');
+  assert.notEqual(ab, buildChatId('u_alice', 'u_charlie'));
 });
 
-test('encryptText and decryptText accurately protect message content', async () => {
-  const key = await deriveRoomKey('quantum-shield-999', 'room-alpha');
-  const secretMessage = 'Top secret private rendezvous at 21:00. Bring the keys.';
-
-  const { ciphertext, iv } = await encryptText(secretMessage, key);
-
-  // Ciphertext must not contain plaintext
-  assert.notEqual(ciphertext, secretMessage);
-  assert.ok(ciphertext.length > 20);
-  assert.ok(iv.length > 5);
-
-  const decrypted = await decryptText(ciphertext, iv, key);
-  assert.equal(decrypted, secretMessage);
-});
-
-test('decryptText fails with incorrect decryption key', async () => {
-  const keyValid = await deriveRoomKey('correct-passkey', 'room-alpha');
-  const keyWrong = await deriveRoomKey('wrong-passkey', 'room-alpha');
-
-  const { ciphertext, iv } = await encryptText('Sensitive data', keyValid);
-
-  await assert.rejects(async () => {
-    await decryptText(ciphertext, iv, keyWrong);
-  });
-});
-
-test('encryptBinary and decryptBinary correctly encrypt file byte streams', async () => {
-  const key = await deriveRoomKey('file-passkey-777', 'room-beta');
-  const dummyFileData = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04]);
-
-  const { ciphertext, iv } = await encryptBinary(dummyFileData, key);
-  const decryptedData = await decryptBinary(ciphertext, iv, key);
-
-  assert.deepEqual(decryptedData, dummyFileData);
-});
-
-test('generateRoomId and generateRandomPasskey produce non-empty unique tokens', () => {
-  const roomId = generateRoomId();
-  const passkey = generateRandomPasskey();
-
-  assert.ok(roomId.length >= 6);
-  assert.ok(passkey.includes('-'));
+test('usernames normalise and ids look sane', () => {
+  assert.equal(normalizeUsername('  @@Alex_99 '), 'alex_99');
+  assert.equal(normalizeUsername('Sam Doe!'), 'samdoe');
+  assert.ok(generateUserId().startsWith('u_'));
 });

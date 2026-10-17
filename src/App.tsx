@@ -1,814 +1,622 @@
-/**
- * tg-enc
- * 1-on-1 End-to-End Encrypted Cloud Messenger
- */
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Header } from './components/Header.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { ChatArea } from './components/ChatArea.tsx';
-import { SafetyNumberModal } from './components/SafetyNumberModal.tsx';
-import { QRModal } from './components/QRModal.tsx';
-import { ScreenShield } from './components/ScreenShield.tsx';
-import { PanicWipeModal } from './components/PanicWipeModal.tsx';
-import { MediaLightbox } from './components/MediaLightbox.tsx';
-import { JoinCreateModal } from './components/JoinCreateModal.tsx';
-import { SupabaseModal } from './components/SupabaseModal.tsx';
+import { DeleteChatModal } from './components/DeleteChatModal.tsx';
+import { AuthScreen } from './components/AuthScreen.tsx';
+import { MessagesSquare } from 'lucide-react';
 
 import {
-  setupSupabaseRoomChannel,
-  persistEnvelopeToSupabase,
-  fetchEnvelopesFromSupabase,
-  wipeSupabaseRoom,
-  type SupabaseRoomSubscription,
+  setupChatChannel,
+  setupInboxChannel,
+  persistMessage,
+  fetchMessages,
+  fetchReactions,
+  addReaction,
+  removeReaction,
+  fetchReadStates,
+  markRead,
+  deleteConversation,
+  upsertConversation,
+  touchConversation,
+  fetchConversations,
+  fetchProfileByUsername,
+  fetchProfileById,
+  searchProfiles,
+  touchLastSeen,
+  deleteOwnAccount,
+  joinAsUser,
+  type ChatSubscription,
 } from './lib/supabase.ts';
 
 import {
-  deriveRoomKey,
-  encryptText,
-  decryptText,
-  encryptBinary,
-  decryptBinary,
-  generateSafetyNumber,
-  base64ToUint8Array,
-  uint8ArrayToBase64,
-} from './crypto/crypto.ts';
+  loadIdentity,
+  saveIdentity,
+  clearLocalIdentity,
+  loadChats,
+  saveChats,
+  mergeConversations,
+} from './lib/identity.ts';
 
 import {
-  playSentSound,
-  playReceivedSound,
-  playWipeSound,
-} from './utils/audio.ts';
+  buildChatId,
+  normalizeUsername,
+} from './crypto/crypto.ts';
+
+import { playSentSound, playReceivedSound } from './utils/audio.ts';
 
 import type {
-  UserSession,
-  PeerState,
+  LocalIdentity,
+  ChatSummary,
   DecryptedMessage,
-  EncryptedEnvelope,
+  PeerState,
 } from './types/chat.ts';
 
+const PAGE_SIZE = 100;
+
+function resolveReplySnippets(list: DecryptedMessage[]): DecryptedMessage[] {
+  const byId = new Map(list.map((m) => [m.id, m]));
+  return list.map((m) => {
+    if (!m.replyToId || m.replySnippet) return m;
+    const parent = byId.get(m.replyToId);
+    return parent ? { ...m, replySnippet: parent.content } : m;
+  });
+}
+
 export default function App() {
-  const [session, setSession] = useState<UserSession | null>(null);
-  const [cryptoKey, setCryptoKey] = useState<CryptoKey | null>(null);
+  const [identity, setIdentity] = useState<LocalIdentity | null>(() => loadIdentity(null));
+  const [chats, setChats] = useState<ChatSummary[]>(() => loadChats());
+  const [activeChat, setActiveChat] = useState<ChatSummary | null>(null);
   const [messages, setMessages] = useState<DecryptedMessage[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [peer, setPeer] = useState<PeerState | null>(null);
   const [replyTo, setReplyTo] = useState<DecryptedMessage | null>(null);
 
-  // Modals & Privacy Controls
-  const [isShieldActive, setIsShieldActive] = useState(false);
-  const [isSafetyModalOpen, setIsSafetyModalOpen] = useState(false);
-  const [isQRModalOpen, setIsQRModalOpen] = useState(false);
-  const [isPanicModalOpen, setIsPanicModalOpen] = useState(false);
-  const [activeLightbox, setActiveLightbox] = useState<{ url: string; name?: string } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ChatSummary | null>(null);
+  const [deletingChat, setDeletingChat] = useState(false);
   const [isSidebarOpenMobile, setIsSidebarOpenMobile] = useState(false);
-  const [isSupabaseModalOpen, setIsSupabaseModalOpen] = useState(false);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const supabaseSubRef = useRef<SupabaseRoomSubscription | null>(null);
-  const cryptoKeyRef = useRef<CryptoKey | null>(null);
-  cryptoKeyRef.current = cryptoKey;
+  const identityRef = useRef<LocalIdentity | null>(identity);
+  identityRef.current = identity;
+  const chatsRef = useRef<ChatSummary[]>(chats);
+  chatsRef.current = chats;
+  const activeChatRef = useRef<ChatSummary | null>(activeChat);
+  activeChatRef.current = activeChat;
 
-  // Track created object URLs so we can cleanly revoke on unmount or wipe
-  const createdObjectUrlsRef = useRef<string[]>([]);
+  const chatSubRef = useRef<ChatSubscription | null>(null);
+  const inboxRef = useRef<ReturnType<typeof setupInboxChannel> | null>(null);
 
-  const registerBlobUrl = (url: string) => {
-    createdObjectUrlsRef.current.push(url);
-    return url;
-  };
+  // ------------------------------------------------------------ persistence
 
-  const cleanupObjectUrls = () => {
-    createdObjectUrlsRef.current.forEach((url) => {
+  const persistChats = useCallback((next: ChatSummary[]) => {
+    const sorted = [...next].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    setChats(sorted);
+    saveChats(sorted);
+  }, []);
+
+  const refreshInbox = useCallback(
+    async (me: LocalIdentity) => {
       try {
-        URL.revokeObjectURL(url);
-      } catch {
-        // ignore
-      }
-    });
-    createdObjectUrlsRef.current = [];
-  };
-
-  // Helper to decrypt an envelope into a DecryptedMessage
-  const decryptEnvelope = useCallback(
-    async (envelope: EncryptedEnvelope, key: CryptoKey): Promise<DecryptedMessage | null> => {
-      try {
-        if (!envelope.payload) return null;
-
-        if (envelope.type === 'text') {
-          const plainText = await decryptText(
-            envelope.payload.ciphertext,
-            envelope.payload.iv,
-            key
-          );
-          return {
-            id: envelope.id,
-            roomId: envelope.roomId,
-            senderId: envelope.senderId,
-            senderName: envelope.senderName,
-            type: 'text',
-            content: plainText,
-            replyToId: envelope.replyToId,
-            timestamp: envelope.timestamp,
-            status: 'read',
-            reactions: {},
-          };
-        }
-
-        if (envelope.type === 'file' || envelope.type === 'audio') {
-          const decryptedBytes = await decryptBinary(
-            envelope.payload.ciphertext,
-            envelope.payload.iv,
-            key
-          );
-          const mimeType = envelope.metadata?.mimeType || 'application/octet-stream';
-          const blob = new Blob([decryptedBytes as unknown as BlobPart], { type: mimeType });
-          const blobUrl = registerBlobUrl(URL.createObjectURL(blob));
-
-          let previewContent = '';
-          if (mimeType.startsWith('image/')) {
-            previewContent = `data:${mimeType};base64,${uint8ArrayToBase64(decryptedBytes)}`;
+        const rows = await fetchConversations(me.userId);
+        const merged = await mergeConversations(me.userId, rows, loadChats(), async (id) => {
+          try {
+            return await fetchProfileById(id);
+          } catch {
+            return null;
           }
-
-          return {
-            id: envelope.id,
-            roomId: envelope.roomId,
-            senderId: envelope.senderId,
-            senderName: envelope.senderName,
-            type: envelope.type,
-            content: previewContent,
-            fileBlobUrl: blobUrl,
-            fileMetadata: envelope.metadata,
-            replyToId: envelope.replyToId,
-            timestamp: envelope.timestamp,
-            status: 'read',
-            reactions: {},
-          };
-        }
-
-        return null;
+        });
+        persistChats(merged);
       } catch (err) {
-        console.error('Failed to decrypt envelope:', err);
-        return null;
+        console.warn('Could not refresh the inbox:', err);
       }
     },
-    []
+    [persistChats]
   );
 
-  // Initialize room session and derive key
-  const handleJoinOrCreate = async (params: {
-    username: string;
-    roomId: string;
-    roomPasskey: string;
-    isHost: boolean;
-  }) => {
-    try {
-      const derivedKey = await deriveRoomKey(params.roomPasskey, params.roomId);
-      const safetyNumber = await generateSafetyNumber(derivedKey);
+  // Load inbox + subscribe to real-time events
+  useEffect(() => {
+    if (!identity) return;
+    touchLastSeen(identity.userId);
+    refreshInbox(identity);
 
-      // Stable user ID
-      let userId = sessionStorage.getItem('telegram_secret_user_id');
-      if (!userId) {
-        userId = `user-${Math.random().toString(36).substring(2, 9)}`;
-        sessionStorage.setItem('telegram_secret_user_id', userId);
-      }
-
-      const newSession: UserSession = {
-        userId,
-        username: params.username,
-        roomId: params.roomId,
-        roomPasskey: params.roomPasskey,
-        safetyNumber,
-        isHost: params.isHost,
-      };
-
-      setCryptoKey(derivedKey);
-      setSession(newSession);
-
-      // Connect WebSocket & Supabase Cloud
-      connectWebSocket(newSession, derivedKey);
-      connectSupabase(newSession, derivedKey);
-    } catch (err) {
-      console.error('Failed to initialize secret room:', err);
-      alert('Failed to derive encryption keys. Please try again.');
-    }
-  };
-
-  // Connect Supabase Realtime Channel and load history
-  const connectSupabase = (sess: UserSession, key: CryptoKey) => {
-    if (supabaseSubRef.current) {
-      supabaseSubRef.current.leave();
-    }
-
-    // Load existing history from Supabase Postgres if table exists
-    fetchEnvelopesFromSupabase(sess.roomId).then(async (envelopes) => {
-      if (envelopes.length > 0) {
-        const decryptedList: DecryptedMessage[] = [];
-        for (const env of envelopes) {
-          const dec = await decryptEnvelope(env, key);
-          if (dec) decryptedList.push(dec);
-        }
-        if (decryptedList.length > 0) {
-          setMessages((prev) => {
-            const existingIds = new Set(prev.map((m) => m.id));
-            const newOnes = decryptedList.filter((m) => !existingIds.has(m.id));
-            return [...prev, ...newOnes];
-          });
-        }
-      }
-    });
-
-    const sub = setupSupabaseRoomChannel(sess.roomId, sess.userId, sess.username, {
-      onEnvelope: async (env) => {
-        const dec = await decryptEnvelope(env, key);
-        if (dec) {
-          setMessages((prev) => {
-            if (prev.some((m) => m.id === dec.id)) return prev;
-            return [...prev, dec];
-          });
-          if (dec.senderId !== sess.userId) {
-            playReceivedSound();
-            sub.broadcastReadReceipt([dec.id], sess.userId);
-          }
-        }
+    inboxRef.current?.unsubscribe();
+    inboxRef.current = setupInboxChannel(identity.userId, {
+      onConversation: () => {
+        if (identityRef.current) refreshInbox(identityRef.current);
       },
-      onTyping: (payload) => {
-        if (payload.userId !== sess.userId) {
-          setPeer((prev) => ({
-            id: payload.userId,
-            name: payload.username || 'Friend',
-            isTyping: !!payload.isTyping,
-            isOnline: true,
-            lastSeen: Date.now(),
-          }));
-        }
-      },
-      onReaction: (payload) => {
-        setMessages((prev) =>
-          prev.map((m) => {
-            if (m.id !== payload.targetMessageId) return m;
-            const newReactions = { ...m.reactions };
-            const list = newReactions[payload.emoji] || [];
-            if (list.includes(payload.username)) {
-              newReactions[payload.emoji] = list.filter((u) => u !== payload.username);
-            } else {
-              newReactions[payload.emoji] = [...list, payload.username];
-            }
-            return { ...m, reactions: newReactions };
-          })
-        );
-      },
-      onReadReceipt: (payload) => {
-        setMessages((prev) =>
-          prev.map((m) =>
-            payload.messageIds.includes(m.id) ? { ...m, status: 'read' } : m
-          )
-        );
-      },
-      onWipe: () => {
-        playWipeSound();
-        cleanupObjectUrls();
-        setMessages([]);
-        alert('Notice: The secret chat room was wiped.');
-      },
-      onPresenceChange: (activeParticipants) => {
-        const others = activeParticipants.filter((p) => p.userId !== sess.userId);
-        if (others.length > 0) {
-          setPeer({
-            id: others[0].userId,
-            name: others[0].username,
-            isTyping: false,
-            isOnline: true,
-            lastSeen: Date.now(),
-          });
+      onMessage: (chatId) => {
+        if (identityRef.current) refreshInbox(identityRef.current);
+        if (activeChatRef.current?.chatId !== chatId) {
+          setChats((prev) =>
+            prev.map((c) => (c.chatId === chatId ? { ...c, unread: true } : c))
+          );
         }
       },
     });
 
-    supabaseSubRef.current = sub;
-  };
+    const interval = setInterval(() => touchLastSeen(identity.userId), 60_000);
 
-  // Connect WebSocket to cloud relay
-  const connectWebSocket = (sess: UserSession, key: CryptoKey) => {
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
-    const socket = new WebSocket(wsUrl);
-    wsRef.current = socket;
-
-    socket.onopen = () => {
-      // Send join event
-      socket.send(
-        JSON.stringify({
-          type: 'join',
-          roomId: sess.roomId,
-          userId: sess.userId,
-          username: sess.username,
-        })
-      );
+    return () => {
+      clearInterval(interval);
+      inboxRef.current?.unsubscribe();
     };
+  }, [identity, refreshInbox]);
 
-    socket.onmessage = async (event) => {
+  // ------------------------------------------------------------ active chat
+
+  const tearDownChat = useCallback(() => {
+    chatSubRef.current?.leave();
+    chatSubRef.current = null;
+  }, []);
+
+  const openChat = useCallback(
+    async (chat: ChatSummary) => {
+      const me = identityRef.current;
+      if (!me) return;
+
+      tearDownChat();
+      setActiveChat(chat);
+      setMessages([]);
+      setReplyTo(null);
+      setIsSidebarOpenMobile(false);
+
+      // Clear unread
+      setChats((prev) =>
+        prev.map((c) => (c.chatId === chat.chatId ? { ...c, unread: false } : c))
+      );
+
+      // Set initial peer state
+      setPeer({
+        id: chat.peerId,
+        name: chat.peerName,
+        isTyping: false,
+        isOnline: false,
+        lastSeen: 0,
+      });
+
+      // Load messages
       try {
-        const data = JSON.parse(event.data);
+        const history = await fetchMessages(chat.chatId, { limit: PAGE_SIZE });
+        const [reactions, reads] = await Promise.all([
+          fetchReactions(chat.chatId).catch(() => []),
+          fetchReadStates(chat.chatId).catch((): Record<string, number> => ({})),
+        ]);
 
-        switch (data.type) {
-          case 'history': {
-            if (Array.isArray(data.messages) && key) {
-              const decryptedList: DecryptedMessage[] = [];
-              for (const env of data.messages) {
-                const dec = await decryptEnvelope(env, key);
-                if (dec) decryptedList.push(dec);
-              }
-              setMessages(decryptedList);
-            }
-            break;
+        const reactionsByMsg = new Map<string, Record<string, string[]>>();
+        for (const r of reactions) {
+          if (!reactionsByMsg.has(r.messageId)) reactionsByMsg.set(r.messageId, {});
+          const map = reactionsByMsg.get(r.messageId)!;
+          if (!map[r.emoji]) map[r.emoji] = [];
+          map[r.emoji].push(r.username);
+        }
+
+        const peerLastRead = reads[chat.peerId] || 0;
+        const resolved = history.map((m) => ({
+          ...m,
+          status:
+            m.senderId === me.userId
+              ? peerLastRead >= m.timestamp
+                ? ('read' as const)
+                : ('sent' as const)
+              : ('read' as const),
+          reactions: reactionsByMsg.get(m.id) || {},
+        }));
+
+        setMessages(resolveReplySnippets(resolved));
+        setHasMore(history.length >= PAGE_SIZE);
+
+        markRead(chat.chatId, me.userId, Date.now()).catch(() => {});
+      } catch (err) {
+        console.warn('Could not load chat history:', err);
+      }
+
+      // Realtime subscription
+      chatSubRef.current = setupChatChannel(chat.chatId, me.userId, me.username, {
+        onMessage: (incoming) => {
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === incoming.id)) return prev;
+            return resolveReplySnippets([...prev, incoming]);
+          });
+
+          playReceivedSound();
+          markRead(chat.chatId, me.userId, Date.now()).catch(() => {});
+          chatSubRef.current?.broadcastReadReceipt(me.userId, Date.now()).catch(() => {});
+
+          setChats((prev) =>
+            prev.map((c) =>
+              c.chatId === chat.chatId
+                ? { ...c, lastMessage: incoming.content, updatedAt: incoming.timestamp }
+                : c
+            )
+          );
+        },
+        onTyping: ({ userId, isTyping }) => {
+          if (userId === chat.peerId) {
+            setPeer((p) => (p ? { ...p, isTyping } : p));
           }
-
-          case 'envelope': {
-            const env = data.envelope as EncryptedEnvelope;
-            if (env && key) {
-              const dec = await decryptEnvelope(env, key);
-              if (dec) {
-                setMessages((prev) => {
-                  // Guard against duplicates (idempotency)
-                  if (prev.some((m) => m.id === dec.id)) return prev;
-                  return [...prev, dec];
-                });
-
-                if (dec.senderId !== sess.userId) {
-                  playReceivedSound();
-                  // Send read receipt
-                  if (socket.readyState === WebSocket.OPEN) {
-                    socket.send(
-                      JSON.stringify({
-                        type: 'read_receipt',
-                        messageIds: [dec.id],
-                      })
-                    );
-                  }
-                }
+        },
+        onReaction: ({ targetMessageId, emoji, username: u }) => {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== targetMessageId) return m;
+              const nextReactions = { ...m.reactions };
+              const currentList = nextReactions[emoji] || [];
+              if (!currentList.includes(u)) {
+                nextReactions[emoji] = [...currentList, u];
               }
-            }
-            break;
-          }
-
-          case 'ack': {
-            // Confirm delivery of sent message
+              return { ...m, reactions: nextReactions };
+            })
+          );
+        },
+        onReadReceipt: ({ readByUserId, at }) => {
+          if (readByUserId === chat.peerId) {
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === data.id ? { ...m, status: 'delivered' } : m
+                m.senderId === me.userId && m.timestamp <= at && m.status !== 'read'
+                  ? { ...m, status: 'read' }
+                  : m
               )
             );
-            break;
           }
+        },
+        onChatDeleted: () => {
+          tearDownChat();
+          setActiveChat(null);
+          setMessages([]);
+          setChats((prev) => prev.filter((c) => c.chatId !== chat.chatId));
+        },
+        onPresenceChange: (activeParticipants) => {
+          const isPeerPresent = activeParticipants.some((p) => p.userId === chat.peerId);
+          setPeer((p) => (p ? { ...p, isOnline: isPeerPresent } : p));
+        },
+      });
+    },
+    [tearDownChat]
+  );
 
-          case 'read_receipt': {
-            if (Array.isArray(data.messageIds)) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  data.messageIds.includes(m.id) ? { ...m, status: 'read' } : m
-                )
-              );
-            }
-            break;
-          }
+  const loadOlderMessages = async () => {
+    const chat = activeChatRef.current;
+    const me = identityRef.current;
+    if (!chat || !me || messages.length === 0 || loadingOlder) return;
 
-          case 'typing': {
-            if (data.userId !== sess.userId) {
-              setPeer((prev) => ({
-                id: data.userId,
-                name: data.username || 'Friend',
-                isTyping: !!data.isTyping,
-                isOnline: true,
-                lastSeen: Date.now(),
-              }));
-            }
-            break;
-          }
+    setLoadingOlder(true);
+    try {
+      const oldest = messages[0].timestamp;
+      const older = await fetchMessages(chat.chatId, { before: oldest, limit: PAGE_SIZE });
+      const reads: Record<string, number> = await fetchReadStates(chat.chatId).catch(() => ({}));
+      const peerLastRead = reads[chat.peerId] || 0;
 
-          case 'presence': {
-            const others = (data.participants || []).filter(
-              (p: { userId: string }) => p.userId !== sess.userId
-            );
-            if (others.length > 0) {
-              setPeer({
-                id: others[0].userId,
-                name: others[0].username,
-                isTyping: false,
-                isOnline: true,
-                lastSeen: Date.now(),
-              });
-            } else {
-              setPeer((prev) => (prev ? { ...prev, isOnline: false } : null));
-            }
-            break;
-          }
+      const resolved = older.map((m) => ({
+        ...m,
+        status:
+          m.senderId === me.userId
+            ? peerLastRead >= m.timestamp
+              ? ('read' as const)
+              : ('sent' as const)
+            : ('read' as const),
+        reactions: {},
+      }));
 
-          case 'reaction': {
-            setMessages((prev) =>
-              prev.map((m) => {
-                if (m.id !== data.targetMessageId) return m;
-                const newReactions = { ...m.reactions };
-                const list = newReactions[data.emoji] || [];
-                if (list.includes(data.username)) {
-                  newReactions[data.emoji] = list.filter((u) => u !== data.username);
-                } else {
-                  newReactions[data.emoji] = [...list, data.username];
-                }
-                return { ...m, reactions: newReactions };
-              })
-            );
-            break;
-          }
-
-          case 'wiped': {
-            // Room was wiped
-            playWipeSound();
-            cleanupObjectUrls();
-            setMessages([]);
-            alert('Notice: The secret chat room was wiped.');
-            break;
-          }
-        }
-      } catch (err) {
-        console.error('Error handling incoming WebSocket message:', err);
-      }
-    };
-
-    socket.onclose = () => {
-      // Reconnection logic if session is still active
-      setTimeout(() => {
-        if (wsRef.current === socket && session && cryptoKey) {
-          connectWebSocket(session, cryptoKey);
-        }
-      }, 2500);
-    };
+      setMessages((prev) => resolveReplySnippets([...resolved, ...prev]));
+      setHasMore(older.length >= PAGE_SIZE);
+    } catch (err) {
+      console.warn('Could not load older messages:', err);
+    } finally {
+      setLoadingOlder(false);
+    }
   };
 
-  // Send Text Message
+  // ----------------------------------------------------------- send message
+
   const handleSendMessage = async (text: string, replyToId?: string) => {
-    if (!session || !cryptoKey || !wsRef.current) return;
+    const me = identityRef.current;
+    const chat = activeChatRef.current;
+    if (!me || !chat || !text.trim()) return;
+
+    const id = 'm_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+    const now = Date.now();
+
+    const parent = replyToId ? messages.find((m) => m.id === replyToId) : undefined;
+    const optimistic: DecryptedMessage = {
+      id,
+      chatId: chat.chatId,
+      senderId: me.userId,
+      content: text,
+      replyToId,
+      replySnippet: parent ? parent.content : undefined,
+      timestamp: now,
+      status: 'sending',
+      reactions: {},
+    };
+
+    setMessages((prev) => [...prev, optimistic]);
+    playSentSound();
 
     try {
-      const { ciphertext, iv } = await encryptText(text, cryptoKey);
-      const messageId = `msg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-
-      const envelope: EncryptedEnvelope = {
-        id: messageId,
-        roomId: session.roomId,
-        senderId: session.userId,
-        senderName: session.username,
-        type: 'text',
-        payload: { ciphertext, iv },
-        replyToId,
-        timestamp: Date.now(),
-      };
-
-      // Optimistic local update
-      const localMsg: DecryptedMessage = {
-        id: messageId,
-        roomId: session.roomId,
-        senderId: session.userId,
-        senderName: session.username,
-        type: 'text',
+      await persistMessage({
+        id,
+        chatId: chat.chatId,
+        senderId: me.userId,
         content: text,
         replyToId,
-        replySnippet: replyTo?.content || replyTo?.fileMetadata?.fileName,
-        timestamp: envelope.timestamp,
+        timestamp: now,
+      });
+
+      await chatSubRef.current?.broadcastMessage({
+        ...optimistic,
         status: 'sent',
-        reactions: {},
-      };
+      });
 
-      setMessages((prev) => [...prev, localMsg]);
-      playSentSound();
+      await touchConversation(chat.chatId, now);
 
-      // Relay through cloud WebSocket
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'envelope', envelope }));
-      }
+      setMessages((prev) =>
+        prev.map((m) => (m.id === id ? { ...m, status: 'sent' } : m))
+      );
 
-      // Relay through Supabase Realtime Channel & persist encrypted envelope
-      supabaseSubRef.current?.broadcastEnvelope(envelope);
-      persistEnvelopeToSupabase(envelope);
+      setChats((prev) => {
+        const next = prev.map((c) =>
+          c.chatId === chat.chatId ? { ...c, lastMessage: text, updatedAt: now } : c
+        );
+        return [...next].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      });
     } catch (err) {
-      console.error('Failed to encrypt and send message:', err);
+      console.error('Failed to send message:', err);
+      setMessages((prev) =>
+        prev.map((m) => (m.id === id ? { ...m, status: 'failed' } : m))
+      );
     }
   };
 
-  // Send Encrypted File / Photo
-  const handleSendFile = async (file: File, replyToId?: string) => {
-    if (!session || !cryptoKey || !wsRef.current) return;
+  const handleRetryMessage = async (messageId: string) => {
+    const msg = messages.find((m) => m.id === messageId);
+    const me = identityRef.current;
+    const chat = activeChatRef.current;
+    if (!msg || !me || !chat) return;
+
+    setMessages((prev) =>
+      prev.map((m) => (m.id === messageId ? { ...m, status: 'sending' } : m))
+    );
 
     try {
-      const buffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      const { ciphertext, iv } = await encryptBinary(bytes, cryptoKey);
-      const messageId = `file-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      await persistMessage({
+        id: msg.id,
+        chatId: chat.chatId,
+        senderId: me.userId,
+        content: msg.content,
+        replyToId: msg.replyToId,
+        timestamp: msg.timestamp,
+      });
 
-      const envelope: EncryptedEnvelope = {
-        id: messageId,
-        roomId: session.roomId,
-        senderId: session.userId,
-        senderName: session.username,
-        type: 'file',
-        payload: { ciphertext, iv },
-        metadata: {
-          fileName: file.name,
-          mimeType: file.type || 'application/octet-stream',
-          fileSize: file.size,
-        },
-        replyToId,
-        timestamp: Date.now(),
-      };
-
-      // Optimistic preview
-      const isImg = file.type.startsWith('image/');
-      let previewContent = '';
-      if (isImg) {
-        previewContent = `data:${file.type};base64,${uint8ArrayToBase64(bytes)}`;
-      }
-
-      const blob = new Blob([bytes as unknown as BlobPart], { type: file.type });
-      const blobUrl = registerBlobUrl(URL.createObjectURL(blob));
-
-      const localMsg: DecryptedMessage = {
-        id: messageId,
-        roomId: session.roomId,
-        senderId: session.userId,
-        senderName: session.username,
-        type: 'file',
-        content: previewContent,
-        fileBlobUrl: blobUrl,
-        fileMetadata: envelope.metadata,
-        replyToId,
-        replySnippet: replyTo?.content || replyTo?.fileMetadata?.fileName,
-        timestamp: envelope.timestamp,
-        status: 'sent',
-        reactions: {},
-      };
-
-      setMessages((prev) => [...prev, localMsg]);
-      playSentSound();
-
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'envelope', envelope }));
-      }
-
-      // Broadcast and persist to Supabase
-      supabaseSubRef.current?.broadcastEnvelope(envelope);
-      persistEnvelopeToSupabase(envelope);
-    } catch (err) {
-      console.error('Failed to encrypt and send file:', err);
-      alert('Failed to encrypt file. Check file size and format.');
+      await chatSubRef.current?.broadcastMessage({ ...msg, status: 'sent' });
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, status: 'sent' } : m))
+      );
+    } catch {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, status: 'failed' } : m))
+      );
     }
   };
 
-  // Send Encrypted Voice Note
-  const handleSendVoiceNote = async (audioBlob: Blob, duration: number, replyToId?: string) => {
-    if (!session || !cryptoKey || !wsRef.current) return;
-
-    try {
-      const buffer = await audioBlob.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      const { ciphertext, iv } = await encryptBinary(bytes, cryptoKey);
-      const messageId = `audio-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-
-      const envelope: EncryptedEnvelope = {
-        id: messageId,
-        roomId: session.roomId,
-        senderId: session.userId,
-        senderName: session.username,
-        type: 'audio',
-        payload: { ciphertext, iv },
-        metadata: {
-          fileName: 'Voice Message.webm',
-          mimeType: audioBlob.type || 'audio/webm',
-          fileSize: audioBlob.size,
-          duration,
-        },
-        replyToId,
-        timestamp: Date.now(),
-      };
-
-      const blobUrl = registerBlobUrl(URL.createObjectURL(audioBlob));
-
-      const localMsg: DecryptedMessage = {
-        id: messageId,
-        roomId: session.roomId,
-        senderId: session.userId,
-        senderName: session.username,
-        type: 'audio',
-        content: '',
-        fileBlobUrl: blobUrl,
-        fileMetadata: envelope.metadata,
-        replyToId,
-        replySnippet: replyTo?.content || replyTo?.fileMetadata?.fileName,
-        timestamp: envelope.timestamp,
-        status: 'sent',
-        reactions: {},
-      };
-
-      setMessages((prev) => [...prev, localMsg]);
-      playSentSound();
-
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'envelope', envelope }));
-      }
-
-      // Broadcast and persist voice note to Supabase
-      supabaseSubRef.current?.broadcastEnvelope(envelope);
-      persistEnvelopeToSupabase(envelope);
-    } catch (err) {
-      console.error('Failed to encrypt voice message:', err);
-    }
-  };
-
-  // Send Typing Indicator
   const handleTyping = (isTyping: boolean) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'typing', isTyping }));
-    }
-    if (session) {
-      supabaseSubRef.current?.broadcastTyping(session.userId, session.username, isTyping);
-    }
+    const me = identityRef.current;
+    if (!me) return;
+    chatSubRef.current?.broadcastTyping(me.userId, me.username, isTyping).catch(() => {});
   };
 
-  // Send Reaction
-  const handleReact = (messageId: string, emoji: string) => {
-    if (!session || !wsRef.current) return;
+  const handleReact = async (messageId: string, emoji: string) => {
+    const me = identityRef.current;
+    const chat = activeChatRef.current;
+    if (!me || !chat) return;
 
-    // Optimistic local update
+    const msg = messages.find((m) => m.id === messageId);
+    if (!msg) return;
+
+    const list = msg.reactions[emoji] || [];
+    const alreadyReacted = list.includes(me.username);
+
     setMessages((prev) =>
       prev.map((m) => {
         if (m.id !== messageId) return m;
-        const newReactions = { ...m.reactions };
-        const list = newReactions[emoji] || [];
-        if (list.includes(session.username)) {
-          newReactions[emoji] = list.filter((u) => u !== session.username);
+        const next = { ...m.reactions };
+        if (alreadyReacted) {
+          next[emoji] = (next[emoji] || []).filter((u) => u !== me.username);
+          if (next[emoji].length === 0) delete next[emoji];
         } else {
-          newReactions[emoji] = [...list, session.username];
+          next[emoji] = [...(next[emoji] || []), me.username];
         }
-        return { ...m, reactions: newReactions };
+        return { ...m, reactions: next };
       })
     );
 
-    if (wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'reaction',
+    try {
+      if (alreadyReacted) {
+        await removeReaction(messageId, me.userId, emoji);
+      } else {
+        await addReaction(messageId, chat.chatId, me.userId, me.username, emoji);
+        await chatSubRef.current?.broadcastReaction({
           targetMessageId: messageId,
           emoji,
-        })
-      );
+          username: me.username,
+        });
+      }
+    } catch (err) {
+      console.warn('Could not save reaction:', err);
     }
-
-    supabaseSubRef.current?.broadcastReaction(messageId, emoji, session.username);
   };
 
-  // Perform Panic Wipe
-  const handleConfirmPanicWipe = async () => {
-    setIsPanicModalOpen(false);
-    playWipeSound();
+  // ----------------------------------------------------------- start chat
 
-    if (session) {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'wipe' }));
+  const handleStartChat = async (targetHandleOrQuery: string): Promise<string | null> => {
+    const me = identityRef.current;
+    if (!me) return 'Please enter a username first.';
+
+    const clean = normalizeUsername(targetHandleOrQuery);
+    if (clean === me.username.toLowerCase()) {
+      return "You can't start a chat with yourself.";
+    }
+
+    let profile = await fetchProfileByUsername(clean);
+    if (!profile) {
+      const results = await searchProfiles(targetHandleOrQuery, me.userId);
+      if (results.length > 0) profile = results[0];
+    }
+
+    if (!profile) {
+      // Create a placeholder profile so users can message someone who hasn't opened the app yet
+      profile = {
+        userId: `u_${clean}`,
+        username: clean,
+        displayName: clean,
+      };
+    }
+
+    const chatId = buildChatId(me.userId, profile.userId);
+    const now = Date.now();
+
+    await upsertConversation({
+      chatId,
+      userA: me.userId,
+      userB: profile.userId,
+      updatedAt: now,
+    });
+
+    const newChat: ChatSummary = {
+      chatId,
+      peerId: profile.userId,
+      peerUsername: profile.username,
+      peerName: profile.displayName,
+      updatedAt: now,
+      lastMessage: undefined,
+      unread: false,
+    };
+
+    setChats((prev) => {
+      const filtered = prev.filter((c) => c.chatId !== chatId);
+      return [newChat, ...filtered];
+    });
+
+    openChat(newChat);
+    return null;
+  };
+
+  // ---------------------------------------------------------- delete chat
+
+  const handleDeleteChatConfirm = async () => {
+    if (!deleteTarget) return;
+    setDeletingChat(true);
+    try {
+      await deleteConversation(deleteTarget.chatId);
+      await chatSubRef.current?.broadcastChatDeleted();
+
+      if (activeChat?.chatId === deleteTarget.chatId) {
+        tearDownChat();
+        setActiveChat(null);
+        setMessages([]);
       }
-      // Also trigger server-side REST wipe
-      fetch(`/api/room/${encodeURIComponent(session.roomId)}/wipe`, {
-        method: 'POST',
-      }).catch(() => {});
 
-      // Wipe Supabase room and broadcast
-      supabaseSubRef.current?.broadcastWipe();
-      wipeSupabaseRoom(session.roomId);
+      persistChats(chats.filter((c) => c.chatId !== deleteTarget.chatId));
+      setDeleteTarget(null);
+    } finally {
+      setDeletingChat(false);
     }
+  };
 
-    if (supabaseSubRef.current) {
-      supabaseSubRef.current.leave();
-      supabaseSubRef.current = null;
+  // ------------------------------------------------------------- auth
+
+  const handleJoin = async (username: string, displayName: string): Promise<string | null> => {
+    const res = await joinAsUser(username, displayName);
+    if (res.error) return res.error;
+    if (res.user) {
+      setIdentity(res.user);
+      saveIdentity(res.user);
     }
+    return null;
+  };
 
-    cleanupObjectUrls();
+  const handleSignOut = async () => {
+    tearDownChat();
+    clearLocalIdentity();
+    setIdentity(null);
+    setActiveChat(null);
     setMessages([]);
-    setSession(null);
-    setCryptoKey(null);
-    setPeer(null);
-    setReplyTo(null);
-
-    // Clear hash
-    window.history.replaceState(null, '', window.location.pathname);
+    setChats([]);
   };
 
-  const handleLeaveRoom = () => {
-    if (confirm('Leave this secret chat room?')) {
-      if (wsRef.current) wsRef.current.close();
-      if (supabaseSubRef.current) {
-        supabaseSubRef.current.leave();
-        supabaseSubRef.current = null;
-      }
-      cleanupObjectUrls();
-      setMessages([]);
-      setSession(null);
-      setCryptoKey(null);
-      setPeer(null);
-      setReplyTo(null);
-      window.history.replaceState(null, '', window.location.pathname);
-    }
+  const handleDeleteAccount = async () => {
+    const me = identityRef.current;
+    if (!me) return;
+    await deleteOwnAccount(me.userId);
+    handleSignOut();
   };
 
-  // If no active session, render the Join / Create Room Modal
-  if (!session) {
-    return <JoinCreateModal onJoinOrCreate={handleJoinOrCreate} />;
+  // -------------------------------------------------------------- render
+
+  if (!identity) {
+    return <AuthScreen onJoin={handleJoin} />;
   }
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-[#0e1621] text-white overflow-hidden select-none font-sans">
-      {/* Top Bar Header */}
+    <div className="flex flex-col h-screen bg-[#0e1621] text-slate-100 overflow-hidden font-sans">
       <Header
-        session={session}
+        identity={identity}
+        activeChat={activeChat}
         peer={peer}
-        onOpenSafetyModal={() => setIsSafetyModalOpen(true)}
-        onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
-        onTriggerShield={() => setIsShieldActive(true)}
-        onTriggerPanicWipe={() => setIsPanicModalOpen(true)}
-        onToggleSidebar={() => setIsSidebarOpenMobile(!isSidebarOpenMobile)}
-        isSidebarOpen={isSidebarOpenMobile}
+        onDeleteChat={() => activeChat && setDeleteTarget(activeChat)}
+        onSignOut={handleSignOut}
+        onToggleSidebar={() => setIsSidebarOpenMobile((v) => !v)}
       />
 
-      {/* Main Split Layout */}
       <div className="flex-1 flex overflow-hidden relative">
         <Sidebar
-          session={session}
-          peer={peer}
-          messages={messages}
-          onOpenSafetyModal={() => setIsSafetyModalOpen(true)}
-          onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
-          onOpenQRModal={() => setIsQRModalOpen(true)}
-          onLeaveRoom={handleLeaveRoom}
-          onSelectMedia={(m) => {
-            if (m.fileMetadata?.mimeType?.startsWith('image/') && m.content) {
-              setActiveLightbox({ url: m.content, name: m.fileMetadata.fileName });
-            }
-          }}
+          identity={identity}
+          chats={chats}
+          activeChatId={activeChat?.chatId || null}
+          onOpenChat={openChat}
+          onStartChat={handleStartChat}
+          onDeleteChat={(chat) => setDeleteTarget(chat)}
+          onSignOut={handleSignOut}
+          onDeleteAccount={handleDeleteAccount}
           isOpen={isSidebarOpenMobile}
           onCloseMobile={() => setIsSidebarOpenMobile(false)}
         />
 
-        <main className="flex-1 flex flex-col h-full overflow-hidden relative">
+        {activeChat ? (
           <ChatArea
-            session={session}
+            myUserId={identity.userId}
+            peerName={activeChat.peerName || `@${activeChat.peerUsername}`}
             peer={peer}
             messages={messages}
+            hasMore={hasMore}
+            loadingOlder={loadingOlder}
+            onLoadOlder={loadOlderMessages}
             onSendMessage={handleSendMessage}
-            onSendFile={handleSendFile}
-            onSendVoiceNote={handleSendVoiceNote}
             onTyping={handleTyping}
             onReact={handleReact}
-            onImageClick={(url, name) => setActiveLightbox({ url, name })}
+            onRetry={handleRetryMessage}
             replyTo={replyTo}
             setReplyTo={setReplyTo}
           />
-        </main>
+        ) : (
+          <div className="hidden md:flex flex-1 flex-col items-center justify-center text-slate-500 text-sm bg-[#0e1621] select-none p-6 text-center">
+            <div className="w-16 h-16 rounded-full bg-[#17212b] border border-[#242f3d] flex items-center justify-center mb-4 text-[#54a9eb]">
+              <MessagesSquare className="w-8 h-8" />
+            </div>
+            <p className="font-semibold text-white mb-1">Select a chat to start messaging</p>
+            <p className="text-xs text-slate-400 max-w-xs">
+              Search a friend by @username from the left sidebar to start chatting.
+            </p>
+          </div>
+        )}
       </div>
 
-      {/* Modals & Overlays */}
-      <SafetyNumberModal
-        safetyNumber={session.safetyNumber}
-        friendName={peer?.name || 'Friend'}
-        isOpen={isSafetyModalOpen}
-        onClose={() => setIsSafetyModalOpen(false)}
-      />
-
-      <QRModal
-        roomId={session.roomId}
-        roomPasskey={session.roomPasskey}
-        isOpen={isQRModalOpen}
-        onClose={() => setIsQRModalOpen(false)}
-      />
-
-      <ScreenShield
-        isActive={isShieldActive}
-        onUnlock={() => setIsShieldActive(false)}
-      />
-
-      <PanicWipeModal
-        isOpen={isPanicModalOpen}
-        onConfirm={handleConfirmPanicWipe}
-        onCancel={() => setIsPanicModalOpen(false)}
-      />
-
-      <MediaLightbox
-        imageUrl={activeLightbox?.url || null}
-        fileName={activeLightbox?.name}
-        onClose={() => setActiveLightbox(null)}
-      />
-
-      <SupabaseModal
-        isOpen={isSupabaseModalOpen}
-        onClose={() => setIsSupabaseModalOpen(false)}
+      <DeleteChatModal
+        isOpen={Boolean(deleteTarget)}
+        peerName={deleteTarget?.peerName || deleteTarget?.peerUsername || 'Friend'}
+        busy={deletingChat}
+        onConfirm={handleDeleteChatConfirm}
+        onCancel={() => setDeleteTarget(null)}
       />
     </div>
   );
